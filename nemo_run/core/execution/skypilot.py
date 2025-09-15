@@ -213,6 +213,10 @@ class SkypilotExecutor(Executor):
         resources_cfg["any_of"] = any_of
         if self.cluster_config_overrides:
             resources_cfg["_cluster_config_overrides"] = self.cluster_config_overrides
+            # Check if nodes_placement is specified in cluster_config_overrides
+            if "resources" in self.cluster_config_overrides:
+                if "nodes_placement" in self.cluster_config_overrides["resources"]:
+                    resources_cfg["nodes_placement"] = self.cluster_config_overrides["resources"]["nodes_placement"]
 
         resources = Resources.from_yaml_config(resources_cfg)
 
@@ -401,10 +405,26 @@ cd /nemo_run/code
             for mount_path, config in self.storage_mounts.items():
                 # Create Storage object from config dict
                 storage_obj = Storage.from_yaml_config(config)
+                # Avoid syncing on reconstruction for existing buckets during launch
+                try:
+                    storage_obj.sync_on_reconstruction = False
+                except Exception:
+                    pass
                 storage_objects[mount_path] = storage_obj
             task.set_storage_mounts(storage_objects)
 
         task.set_resources(self.to_resources())
+
+        # Debug: dump the final task YAML so we can verify nodes_placement
+        try:
+            import os
+            from sky.utils import yaml_utils
+            dump_dir = os.path.expanduser("~/.nemo_run")
+            os.makedirs(dump_dir, exist_ok=True)
+            with open(os.path.join(dump_dir, "last_task.yml"), "w", encoding="utf-8") as f:
+                f.write(yaml_utils.dump_yaml_str(task.to_yaml_config()))
+        except Exception:
+            pass
 
         if env_vars:
             task.update_envs(env_vars)
@@ -419,11 +439,11 @@ cd /nemo_run/code
         dryrun: bool = False,
     ) -> tuple[Optional[int], Optional["backends.ResourceHandle"]]:
         from sky import backends, launch, stream_and_get
-        from sky.utils import common_utils
-
+        from sky.utils import common_utils, yaml_utils
+        
         task_yml = os.path.join(self.job_dir, "skypilot_task.yml")
         with open(task_yml, "w+") as f:
-            f.write(common_utils.dump_yaml_str(task.to_yaml_config()))
+            f.write(yaml_utils.dump_yaml_str(task.to_yaml_config()))
 
         backend = backends.CloudVmRayBackend()
         if num_nodes:
@@ -431,21 +451,48 @@ cd /nemo_run/code
 
         cluster_name = cluster_name or self.cluster_name or self.experiment_id
 
-        job_id, handle = stream_and_get(
-            launch(
-                task,
-                dryrun=dryrun,
-                cluster_name=cluster_name,
-                backend=backend,
-                idle_minutes_to_autostop=self.idle_minutes_to_autostop,
-                down=self.autodown,
-                fast=True,
-                retry_until_up=self.retry_until_up,
-                # clone_disk_from=clone_disk_from,
+        try:
+            job_id, handle = stream_and_get(
+                launch(
+                    task,
+                    dryrun=dryrun,
+                    cluster_name=cluster_name,
+                    backend=backend,
+                    idle_minutes_to_autostop=self.idle_minutes_to_autostop,
+                    down=self.autodown,
+                    fast=True,
+                    retry_until_up=self.retry_until_up,
+                )
             )
-        )
+            return job_id, handle
+        except Exception as e:
+            def _append_local_trace(header: str, content: str) -> None:
+                try:
+                    trace_dir = os.path.expanduser("~/.nemo_run")
+                    os.makedirs(trace_dir, exist_ok=True)
+                    path = os.path.join(trace_dir, "last_error.trace")
+                    with open(path, "a", encoding="utf-8") as f:
+                        f.write(f"\n===== {header} =====\n")
+                        f.write(content)
+                        if not content.endswith("\n"):
+                            f.write("\n")
+                except Exception:
+                    pass
 
-        return job_id, handle
+            import traceback, subprocess
+            tb = traceback.format_exc()
+            _append_local_trace("SkypilotExecutor.launch exception", tb)
+            # Try to get the latest server/storage logs of Sky API, append to trace file
+            try:
+                out = subprocess.run(["sky","api","logs","-n","1"], capture_output=True, text=True)
+                _append_local_trace("sky api logs -n 1", out.stdout + out.stderr)
+                for name in ("server.log","storage_mounts.log"):
+                    out2 = subprocess.run(["sky","api","logs","-l", f"{out.stdout.strip()}/{name}"] , capture_output=True, text=True)
+
+                    _append_local_trace(f"sky api logs -l .../{name}", out2.stdout + out2.stderr)
+            except Exception:
+                pass
+            raise
 
     def cleanup(self, handle: str):
         import sky.core as sky_core

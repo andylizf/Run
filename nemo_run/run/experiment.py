@@ -14,6 +14,9 @@
 # limitations under the License.
 
 import contextvars
+import os
+from datetime import datetime
+import traceback
 import copy
 import importlib.util
 import inspect
@@ -813,7 +816,30 @@ For more information about `run.Config` and `run.Partial`, please refer to https
                     return job
 
                 except Exception as e:
+                    tb = traceback.format_exc()
+                    import sys
                     self.console.log(f"Error running job {job.id}: {e}")
+                    # Print to console, line by line for Rich
+                    for line in tb.rstrip().splitlines():
+                        try:
+                            self.console.log(line)
+                        except Exception:
+                            pass
+                    # Also persist to a local trace file for diagnosis
+                    try:
+                        trace_dir = os.path.expanduser("~/.nemo_run")
+                        os.makedirs(trace_dir, exist_ok=True)
+                        trace_path = os.path.join(trace_dir, "last_error.trace")
+                        with open(trace_path, "a", encoding="utf-8") as f:
+                            f.write("\n===== nemo_run experiment exception =====\n")
+                            f.write(f"time: {datetime.utcnow().isoformat()}Z\n")
+                            f.write(f"job_id: {getattr(job, 'id', None)}\n")
+                            f.write(f"error_type: {type(e).__name__}\n")
+                            f.write(tb)
+                            f.write("\n")
+                    except Exception:
+                        pass
+                    print(tb, file=sys.stderr, flush=True)
                     raise e
 
             launched_jobs: list[Job | JobGroup] = []
